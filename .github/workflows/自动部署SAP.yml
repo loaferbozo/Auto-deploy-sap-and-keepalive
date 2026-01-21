@@ -26,7 +26,8 @@ on:
         default: false
 
 env:
-  MEMORY: 256M
+  # 建议给到 512M，256M 很容易启动失败
+  MEMORY: 512M
 
 jobs:
   deploy:
@@ -56,6 +57,7 @@ jobs:
 
     - name: 生成应用名称并设置API端点
       run: |
+        # 这里使用了你指定的 API 地址
         if [ "${{ github.event.inputs.region }}" = "SG" ]; then
           echo "CF_API=https://api.cf.ap21.hana.ondemand.com" >> $GITHUB_ENV
           RANDOM_STR=$(head /dev/urandom | tr -dc 'a-z' | head -c 6)
@@ -72,7 +74,8 @@ jobs:
 
     - name: 登录并自动选择组织和空间
       run: |
-        cf login -a ${{ env.CF_API }} -u "${{ secrets.EMAIL }}" -p "${{ secrets.PASSWORD }}"
+        # 增加了错误输出，如果登录失败会提示
+        cf login -a ${{ env.CF_API }} -u "${{ secrets.EMAIL }}" -p "${{ secrets.PASSWORD }}" || { echo "❌ 登录失败！请检查账号密码或 API 地址是否正确"; exit 1; }
         
         echo "登录成功，开始自动检测组织和空间..."
         
@@ -80,7 +83,6 @@ jobs:
         
         if [ -z "$SELECTED_ORG" ]; then
           echo "错误：未能在您的账户下找到任何可用的组织。"
-          echo "请检查您的SAP BTP账户是否已正确设置并启用Cloud Foundry运行时。"
           exit 1
         fi
         
@@ -97,22 +99,13 @@ jobs:
         echo "已自动选择空间: $SELECTED_SPACE"
         cf target -s "$SELECTED_SPACE"
         
-        echo "----------------------------------------"
-        echo "当前部署目标确认:"
-        cf target
-        echo "----------------------------------------"
-        
         echo "SELECTED_ORG=$SELECTED_ORG" >> $GITHUB_ENV
         echo "SELECTED_SPACE=$SELECTED_SPACE" >> $GITHUB_ENV
 
     - name: 部署应用
       run: |
         echo "开始部署应用: ${{ env.APP_NAME }}"
-        echo "使用镜像: ${{ env.DOCKER_IMAGE }}"
-        echo "目标区域: ${{ github.event.inputs.region }}"
-        echo "目标组织: ${{ env.SELECTED_ORG }}"
-        echo "目标空间: ${{ env.SELECTED_SPACE }}"
-        
+        # 这里使用了 increased memory (512M) 和 no-start 策略
         cf push ${{ env.APP_NAME }} --docker-image ${{ env.DOCKER_IMAGE }} -m ${{ env.MEMORY }} --health-check-type port --no-start
 
     - name: 设置环境变量
@@ -130,13 +123,13 @@ jobs:
         cf set-env ${{ env.APP_NAME }} ARGO_PORT "${{ secrets.ARGO_PORT }}"
 
         if echo "${{ secrets.ARGO_AUTH }}" | grep -q '\n'; then
-          echo "检测到组合格式的 ARGO_AUTH，将自动解析域名和Token..."
+          echo "检测到组合格式的 ARGO_AUTH..."
           ARGO_DOMAIN_VALUE=$(echo "${{ secrets.ARGO_AUTH }}" | head -n 1)
           ARGO_AUTH_VALUE=$(echo "${{ secrets.ARGO_AUTH }}" | tail -n +2)
           cf set-env ${{ env.APP_NAME }} ARGO_DOMAIN "$ARGO_DOMAIN_VALUE"
           cf set-env ${{ env.APP_NAME }} ARGO_AUTH "$ARGO_AUTH_VALUE"
         else
-          echo "使用独立的 ARGO_DOMAIN 和 ARGO_AUTH secrets..."
+          echo "使用独立的 ARGO_DOMAIN 和 ARGO_AUTH..."
           cf set-env ${{ env.APP_NAME }} ARGO_DOMAIN "${{ secrets.ARGO_DOMAIN }}"
           cf set-env ${{ env.APP_NAME }} ARGO_AUTH "${{ secrets.ARGO_AUTH }}"
         fi
@@ -144,55 +137,38 @@ jobs:
         CFIP_VALUE="${{ secrets.CFIP }}"
         if [ -z "$CFIP_VALUE" ]; then
           CFIP_VALUE="cf.090227.xyz"
-          echo "未提供 CFIP，使用默认值: $CFIP_VALUE"
         fi
         cf set-env ${{ env.APP_NAME }} CFIP "$CFIP_VALUE"
         
         if [ "${{ github.event.inputs.is_direct_connect }}" = "true" ]; then
-          echo "已选择“直连镜像”模式，开始自动配置 DOMAIN 环境变量..."
+          echo "配置直连模式 DOMAIN..."
           ROUTE=$(cf app ${{ env.APP_NAME }} | grep "routes:" | awk '{print $2}')
           if [ -n "$ROUTE" ]; then
-            echo "已设置 DOMAIN 环境变量为: $ROUTE"
             cf set-env ${{ env.APP_NAME }} DOMAIN "$ROUTE"
-          else
-            echo "警告：未找到应用路由，无法自动设置 DOMAIN, 请在部署成功后手动将节点配置里的address、host和sni改为应用域名"
           fi
         fi
-        
-        echo "环境变量设置完成。"
 
-    - name: 启动应用以应用环境变量
+    - name: 启动应用
       id: start_app
       run: |
-        echo "正在启动应用并应用所有环境变量..."
+        echo "正在启动应用..."
         cf start ${{ env.APP_NAME }}
 
-    - name: 启动失败时自动删除应用
-      if: failure() && steps.start_app.outcome == 'failure'
+    # ⚠️ 关键修改：失败时不再删除应用，而是输出日志方便排查！
+    - name: 部署失败诊断
+      if: failure()
       run: |
-        echo "应用 ${{ env.APP_NAME }} 启动失败。"
-        echo "妈的部署失败... 早上八点来部署肯定他妈的可以"
-        cf delete ${{ env.APP_NAME }} -f -r
-        echo "应用 ${{ env.APP_NAME }} 已成功删除。"
-    
+        echo "❌ 部署或启动失败！正在获取最近的应用日志..."
+        echo "----------------- APP LOGS START -----------------"
+        cf logs ${{ env.APP_NAME }} --recent
+        echo "----------------- APP LOGS END -----------------"
+        echo "⚠️ 应用未删除，请登录 SAP BTP 后台查看详细状态。"
+
     - name: 详细部署信息
+      if: success()
       run: |
         echo "----------------------------------------"
-        echo "部署完成！正在验证应用状态..."
-        cf app ${{ env.APP_NAME }}
-        
         APP_URL=$(cf app ${{ env.APP_NAME }} | grep "routes:" | awk '{print $2}')
-        
-        echo "----------------------------------------"
-        echo "部署成功！详细信息如下："
-        echo "区域 (Region): ${{ github.event.inputs.region }}"
-        echo "组织 (ORG): ${{ env.SELECTED_ORG }}"
-        echo "空间 (SPACE): ${{ env.SELECTED_SPACE }}"
-        echo "应用名称 (App Name): ${{ env.APP_NAME }}"
-        
-        if [ -n "$APP_URL" ]; then
-          echo "应用 URL (APP_URL): https://$APP_URL"
-        else
-          echo "看到这里就证明出问题了。"
-        fi
+        echo "✅ 部署成功！"
+        echo "应用 URL: https://$APP_URL"
         echo "----------------------------------------"
